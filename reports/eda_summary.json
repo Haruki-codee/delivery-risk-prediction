@@ -1,7 +1,19 @@
 {
-  "labeled_delivered_orders":96476.0,
-  "late_orders":7827.0,
-  "late_rate_pct":8.11,
-  "median_delay_days":-11.95,
-  "mean_order_value":137.04
+  "labeled_delivered_orders": 96476,
+  "late_orders": 7827,
+  "late_rate_pct": 8.11,
+  "median_delay_days": -11.95,
+  "mean_order_value_brl": 137.04,
+  "mean_freight_value_brl": 22.79,
+  "intrastate_late_rate_pct": 6.06,
+  "interstate_late_rate_pct": 9.27,
+  "interstate_risk_premium_multiplier": 1.53,
+  "ontime_mean_review_stars": 4.29,
+  "late_mean_review_stars": 2.57,
+  "review_rating_drop_stars": 1.72,
+  "top_risk_state": "AL",
+  "top_risk_state_rate_pct": 23.93,
+  "safest_state": "RO",
+  "median_carrier_handoff_hours": 43.6,
+  "median_estimated_transit_days": 20.3
 }

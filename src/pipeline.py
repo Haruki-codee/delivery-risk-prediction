@@ -17,17 +17,22 @@ ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "data" / "raw"
 ART = ROOT / "artifacts"
 REP = ROOT / "reports"
-ART.mkdir(exist_ok=True); REP.mkdir(exist_ok=True)
+ART.mkdir(exist_ok=True)
+REP.mkdir(exist_ok=True)
 
 FILES = {
-    "orders": "olist_orders_dataset.csv", "items": "olist_order_items_dataset.csv",
-    "payments": "olist_order_payments_dataset.csv", "customers": "olist_customers_dataset.csv",
-    "products": "olist_products_dataset.csv", "sellers": "olist_sellers_dataset.csv",
+    "orders": "olist_orders_dataset.csv",
+    "items": "olist_order_items_dataset.csv",
+    "payments": "olist_order_payments_dataset.csv",
+    "customers": "olist_customers_dataset.csv",
+    "products": "olist_products_dataset.csv",
+    "sellers": "olist_sellers_dataset.csv",
     "reviews": "olist_order_reviews_dataset.csv",
     "translation": "product_category_name_translation.csv",
 }
 
 def load_data():
+    """Load all raw Olist CSV datasets into a dictionary."""
     data = {}
     for key, name in FILES.items():
         path = RAW / name
@@ -37,114 +42,170 @@ def load_data():
     return data
 
 def quality_report(data):
+    """Generate and save data hygiene / quality summary."""
     rows = []
     for name, df in data.items():
         rows.append({
-            "table": name, "rows": len(df), "columns": len(df.columns),
+            "table": name,
+            "rows": len(df),
+            "columns": len(df.columns),
             "duplicate_rows": int(df.duplicated().sum()),
             "total_missing_cells": int(df.isna().sum().sum()),
-            "missing_pct": round(float(df.isna().mean().mean()*100), 3)
+            "missing_pct": round(float(df.isna().mean().mean() * 100), 3)
         })
     report = pd.DataFrame(rows)
-    report.to_csv(REP/"data_quality_summary.csv", index=False)
+    report.to_csv(REP / "data_quality_summary.csv", index=False)
     return report
 
 def build_order_features(data):
+    """
+    Feature engineering at order-level:
+    Joins orders with items, payments, products, customers, and sellers.
+    Computes fulfillment timeline features, cargo attributes, and interstate flags.
+    Prevents data leakage: only post-purchase/pre-delivery fields are used.
+    """
     orders = data["orders"].copy()
-    date_cols = ["order_purchase_timestamp", "order_approved_at",
-                 "order_delivered_carrier_date", "order_delivered_customer_date",
-                 "order_estimated_delivery_date"]
+    date_cols = [
+        "order_purchase_timestamp", "order_approved_at",
+        "order_delivered_carrier_date", "order_delivered_customer_date",
+        "order_estimated_delivery_date"
+    ]
     for c in date_cols:
         orders[c] = pd.to_datetime(orders[c], errors="coerce")
 
+    # Item aggregation and seller integration
     items = data["items"].copy()
-    items_agg = items.groupby("order_id").agg(
+    sellers = data["sellers"][["seller_id", "seller_state"]].drop_duplicates("seller_id")
+    items_seller = items.merge(sellers, on="seller_id", how="left")
+
+    items_agg = items_seller.groupby("order_id").agg(
         item_count=("order_item_id", "count"),
         total_price=("price", "sum"),
         total_freight=("freight_value", "sum"),
         unique_sellers=("seller_id", "nunique"),
         unique_products=("product_id", "nunique"),
-        shipping_limit=("shipping_limit_date", "min")
+        shipping_limit=("shipping_limit_date", "min"),
+        seller_state=("seller_state", "first")
     ).reset_index()
     items_agg["shipping_limit"] = pd.to_datetime(items_agg["shipping_limit"], errors="coerce")
 
+    # Payment aggregation
     pay = data["payments"].groupby("order_id").agg(
         payment_total=("payment_value", "sum"),
         payment_installments_max=("payment_installments", "max"),
         payment_methods=("payment_type", "nunique")
     ).reset_index()
 
-    cust = data["customers"][["customer_id","customer_state","customer_city"]].drop_duplicates("customer_id")
+    # Customer details
+    cust = data["customers"][["customer_id", "customer_state", "customer_city"]].drop_duplicates("customer_id")
     feat = orders.merge(items_agg, on="order_id", how="left").merge(pay, on="order_id", how="left")
     feat = feat.merge(cust, on="customer_id", how="left")
 
-    # Product mix: order-level average product weight and category diversity.
-    product = data["products"][["product_id","product_category_name","product_weight_g"]]
-    item_prod = items.merge(product, on="product_id", how="left")
+    # Product mix: order-level weight, volume and category count
+    product = data["products"].copy()
+    product["product_volume_cm3"] = (
+        product["product_length_cm"] * product["product_height_cm"] * product["product_width_cm"]
+    )
+    item_prod = items.merge(
+        product[["product_id", "product_category_name", "product_weight_g", "product_volume_cm3"]],
+        on="product_id",
+        how="left"
+    )
     prod_agg = item_prod.groupby("order_id").agg(
-        avg_product_weight_g=("product_weight_g","mean"),
-        category_count=("product_category_name","nunique")
+        avg_product_weight_g=("product_weight_g", "mean"),
+        avg_product_volume_cm3=("product_volume_cm3", "mean"),
+        category_count=("product_category_name", "nunique")
     ).reset_index()
     feat = feat.merge(prod_agg, on="order_id", how="left")
 
-    # Label is only defined for completed deliveries with both timestamps.
+    # Target definition: only orders with confirmed delivery timestamps
     delivered = feat["order_delivered_customer_date"].notna() & feat["order_estimated_delivery_date"].notna()
     feat = feat.loc[delivered].copy()
     feat["delivery_delay_days"] = (
         feat["order_delivered_customer_date"] - feat["order_estimated_delivery_date"]
-    ).dt.total_seconds()/86400
+    ).dt.total_seconds() / 86400
     feat["is_late"] = (feat["delivery_delay_days"] > 0).astype(int)
 
+    # Temporal predictors
     feat["purchase_hour"] = feat["order_purchase_timestamp"].dt.hour
+    # Use dt.dayofweek or dt.day_of_week safely
     feat["purchase_dayofweek"] = feat["order_purchase_timestamp"].dt.dayofweek
     feat["purchase_month"] = feat["order_purchase_timestamp"].dt.month
+    feat["is_weekend_purchase"] = (feat["purchase_dayofweek"] >= 5).astype(int)
+
+    # Fulfillment timeline predictors
     feat["approval_delay_hours"] = (
         feat["order_approved_at"] - feat["order_purchase_timestamp"]
-    ).dt.total_seconds()/3600
+    ).dt.total_seconds() / 3600
     feat["carrier_handoff_hours"] = (
         feat["order_delivered_carrier_date"] - feat["order_approved_at"]
-    ).dt.total_seconds()/3600
+    ).dt.total_seconds() / 3600
     feat["estimated_transit_days"] = (
         feat["order_estimated_delivery_date"] - feat["order_delivered_carrier_date"]
-    ).dt.total_seconds()/86400
+    ).dt.total_seconds() / 86400
     feat["shipping_buffer_days"] = (
         feat["order_estimated_delivery_date"] - feat["shipping_limit"]
-    ).dt.total_seconds()/86400
+    ).dt.total_seconds() / 86400
 
-    # Do not use actual delivery timestamp or derived delay as predictors (target leakage).
+    # Interstate route indicator and financial burden
+    feat["is_interstate"] = (feat["customer_state"] != feat["seller_state"]).astype(int)
+    feat["freight_ratio"] = feat["total_freight"] / (feat["total_price"] + 0.01)
+
+    # Sanitize anomalies in delay fields
+    feat["approval_delay_hours"] = feat["approval_delay_hours"].clip(lower=0, upper=168)
+    feat["carrier_handoff_hours"] = feat["carrier_handoff_hours"].clip(lower=0, upper=336)
+
+    # Define feature lists
     numeric = [
-        "item_count","total_price","total_freight","unique_sellers","unique_products",
-        "payment_total","payment_installments_max","payment_methods",
-        "avg_product_weight_g","category_count","purchase_hour","purchase_dayofweek",
-        "purchase_month","approval_delay_hours","carrier_handoff_hours",
-        "estimated_transit_days","shipping_buffer_days"
+        "item_count", "total_price", "total_freight", "freight_ratio",
+        "unique_sellers", "unique_products", "payment_total",
+        "payment_installments_max", "payment_methods",
+        "avg_product_weight_g", "avg_product_volume_cm3", "category_count",
+        "purchase_hour", "purchase_dayofweek", "purchase_month", "is_weekend_purchase",
+        "approval_delay_hours", "carrier_handoff_hours",
+        "estimated_transit_days", "shipping_buffer_days", "is_interstate"
     ]
-    categorical = ["customer_state","order_status"]
-    keep = ["order_id","is_late","delivery_delay_days"] + numeric + categorical
-    out = feat[keep].replace([np.inf,-np.inf], np.nan)
-    out.to_csv(ROOT/"data"/"processed_orders.csv", index=False)
+    categorical = ["customer_state", "order_status"]
+
+    keep_cols = ["order_id", "is_late", "delivery_delay_days", "seller_state"] + numeric + categorical
+    out = feat[keep_cols].replace([np.inf, -np.inf], np.nan)
+    out.to_csv(ROOT / "data" / "processed_orders.csv", index=False)
     return out, numeric, categorical
 
 def train_models(df, numeric, categorical):
+    """
+    Train Logistic Regression, Random Forest, and XGBoost models.
+    Persist trained pipelines, evaluation metrics, threshold curve, and feature importances.
+    """
     X = df[numeric + categorical].copy()
     y = df["is_late"].astype(int)
+
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
+
     pre = ColumnTransformer([
-        ("num", Pipeline([("imputer",SimpleImputer(strategy="median")),
-                          ("scaler",StandardScaler())]), numeric),
-        ("cat", Pipeline([("imputer",SimpleImputer(strategy="most_frequent")),
-                          ("onehot",OneHotEncoder(handle_unknown="ignore"))]), categorical)
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ]), numeric),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore"))
+        ]), categorical)
     ])
+
     models = {
         "logistic_regression": LogisticRegression(max_iter=1500, class_weight="balanced"),
-        "random_forest": RandomForestClassifier(n_estimators=250, min_samples_leaf=3,
-                         class_weight="balanced_subsample", random_state=42, n_jobs=-1)
+        "random_forest": RandomForestClassifier(
+            n_estimators=250, min_samples_leaf=3,
+            class_weight="balanced_subsample", random_state=42, n_jobs=-1
+        )
     }
+
     try:
         from xgboost import XGBClassifier
-        scale = max(1.0, (y_train == 0).sum()/max(1,(y_train == 1).sum()))
+        scale = max(1.0, (y_train == 0).sum() / max(1, (y_train == 1).sum()))
         models["xgboost"] = XGBClassifier(
             n_estimators=350, max_depth=5, learning_rate=0.04,
             subsample=0.85, colsample_bytree=0.85, reg_lambda=2,
@@ -154,45 +215,94 @@ def train_models(df, numeric, categorical):
     except Exception as e:
         warnings.warn(f"XGBoost unavailable; skipping: {e}")
 
-    metrics, fitted = [], {}
+    metrics = []
+    fitted = {}
+
     for name, model in models.items():
-        pipe = Pipeline([("preprocess",pre),("model",model)])
-        pipe.fit(X_train,y_train)
-        prob = pipe.predict_proba(X_test)[:,1]
+        pipe = Pipeline([("preprocess", pre), ("model", model)])
+        pipe.fit(X_train, y_train)
+        prob = pipe.predict_proba(X_test)[:, 1]
         pred = (prob >= 0.5).astype(int)
+
         metrics.append({
-            "model":name, "roc_auc":roc_auc_score(y_test,prob),
-            "pr_auc":average_precision_score(y_test,prob),
-            "precision":precision_score(y_test,pred,zero_division=0),
-            "recall":recall_score(y_test,pred,zero_division=0),
-            "f1":f1_score(y_test,pred,zero_division=0),
-            "test_rows":len(y_test)
+            "model": name,
+            "roc_auc": round(float(roc_auc_score(y_test, prob)), 4),
+            "pr_auc": round(float(average_precision_score(y_test, prob)), 4),
+            "precision": round(float(precision_score(y_test, pred, zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test, pred, zero_division=0)), 4),
+            "f1": round(float(f1_score(y_test, pred, zero_division=0)), 4),
+            "test_rows": len(y_test)
         })
         fitted[name] = pipe
-        joblib.dump(pipe, ART/f"{name}.joblib")
-        pd.DataFrame(classification_report(y_test,pred,output_dict=True)).T.to_csv(REP/f"{name}_classification_report.csv")
-        pd.DataFrame(confusion_matrix(y_test,pred),index=["actual_on_time","actual_late"],
-                     columns=["predicted_on_time","predicted_late"]).to_csv(REP/f"{name}_confusion_matrix.csv")
-    m = pd.DataFrame(metrics).sort_values("roc_auc",ascending=False)
-    m.to_csv(REP/"model_metrics.csv",index=False)
+        joblib.dump(pipe, ART / f"{name}.joblib")
+
+        pd.DataFrame(classification_report(y_test, pred, output_dict=True)).T.to_csv(
+            REP / f"{name}_classification_report.csv"
+        )
+        pd.DataFrame(
+            confusion_matrix(y_test, pred),
+            index=["actual_on_time", "actual_late"],
+            columns=["predicted_on_time", "predicted_late"]
+        ).to_csv(REP / f"{name}_confusion_matrix.csv")
+
+    m = pd.DataFrame(metrics).sort_values("roc_auc", ascending=False)
+    m.to_csv(REP / "model_metrics.csv", index=False)
     best_name = m.iloc[0]["model"]
-    with open(ART/"model_metadata.json","w") as f:
-        json.dump({"best_model":best_name,"numeric_features":numeric,
-                   "categorical_features":categorical,"threshold":0.5},f,indent=2)
-    return m, fitted[best_name], X_test, y_test
+    best_pipe = fitted[best_name]
+
+    # Save model metadata
+    with open(ART / "model_metadata.json", "w") as f:
+        json.dump({
+            "best_model": best_name,
+            "numeric_features": numeric,
+            "categorical_features": categorical,
+            "threshold": 0.5,
+            "available_models": list(models.keys())
+        }, f, indent=2)
+
+    # Threshold sensitivity analysis for operational trade-offs
+    best_prob = best_pipe.predict_proba(X_test)[:, 1]
+    thresh_records = []
+    for t in np.arange(0.05, 0.95, 0.05):
+        t = round(float(t), 2)
+        p_t = (best_prob >= t).astype(int)
+        flagged_count = int(p_t.sum())
+        thresh_records.append({
+            "threshold": t,
+            "flagged_orders": flagged_count,
+            "flagged_pct": round(flagged_count / len(y_test) * 100, 2),
+            "precision": round(float(precision_score(y_test, p_t, zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test, p_t, zero_division=0)), 4),
+            "f1": round(float(f1_score(y_test, p_t, zero_division=0)), 4)
+        })
+    pd.DataFrame(thresh_records).to_csv(REP / "threshold_analysis.csv", index=False)
+
+    return m, best_pipe, X_test, y_test
 
 def run():
-    data=load_data()
+    print("Step 1/3: Loading raw data...")
+    data = load_data()
+
+    print("Step 2/3: Running data quality audit and feature engineering...")
     quality_report(data)
-    df,num,cat=build_order_features(data)
-    metrics,best,X_test,y_test=train_models(df,num,cat)
-    # Persist a compact scoring sample for the dashboard.
-    scored=X_test.copy()
-    scored["actual_is_late"]=y_test.values
-    scored["predicted_late_probability"]=best.predict_proba(X_test)[:,1]
-    scored.to_csv(REP/"test_predictions.csv",index=False)
-    print(f"Completed. Labeled orders: {len(df):,}; late rate: {df.is_late.mean():.1%}")
+    df, num, cat = build_order_features(data)
+
+    print("Step 3/3: Training models and computing metrics...")
+    metrics, best, X_test, y_test = train_models(df, num, cat)
+
+    # Persist rich predictions for the operational risk queue
+    scored = X_test.copy()
+    scored["order_id"] = df.loc[X_test.index, "order_id"].values
+    scored["actual_is_late"] = y_test.values
+    scored["predicted_late_probability"] = np.round(best.predict_proba(X_test)[:, 1], 4)
+
+    # Rank by risk descending
+    scored = scored.sort_values("predicted_late_probability", ascending=False)
+    scored.to_csv(REP / "test_predictions.csv", index=False)
+
+    print(f"\nDone! Delivered orders: {len(df):,}; baseline late rate: {df.is_late.mean():.2%}")
+    print("\nModel Benchmark:")
     print(metrics.to_string(index=False))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     run()
